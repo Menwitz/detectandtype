@@ -45,7 +45,7 @@ class HumanLikeTypingService : AccessibilityService() {
     private lateinit var prefs: SharedPreferences
     private lateinit var sentences: List<SentenceEntry>
     private var serviceActive = false
-    private var isTypingInProgress = false    // guard flag
+    private var isTypingInProgress = false    // prevents repeat on same screen
     private val handler = Handler(Looper.getMainLooper())
 
     private val controlReceiver = object : BroadcastReceiver() {
@@ -53,19 +53,9 @@ class HumanLikeTypingService : AccessibilityService() {
             prefs = PreferenceManager.getDefaultSharedPreferences(this@HumanLikeTypingService)
             serviceActive = prefs.getBoolean("service_active", false)
             when (intent.action) {
-                ACTION_START -> {
-                    Log.d(TAG, "START received; serviceActive=$serviceActive")
-                    if (serviceActive) showStatusNotification()
-                }
-                ACTION_STOP -> {
-                    Log.d(TAG, "STOP received; serviceActive=$serviceActive")
-                    NotificationManagerCompat.from(this@HumanLikeTypingService)
-                        .cancel(NOTIF_ID)
-                }
-                ACTION_DUMP_HIERARCHY -> {
-                    Log.d(TAG, "DUMP_HIERARCHY received")
-                    debugDumpWindow()
-                }
+                ACTION_START -> if (serviceActive) showStatusNotification()
+                ACTION_STOP  -> NotificationManagerCompat.from(this@HumanLikeTypingService).cancel(NOTIF_ID)
+                ACTION_DUMP_HIERARCHY -> debugDumpWindow()
             }
         }
     }
@@ -100,24 +90,24 @@ class HumanLikeTypingService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        // Update which app config to use
+        // Detect app/screen change and reset typing flag
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
             event.eventType == AccessibilityEvent.TYPE_VIEW_FOCUSED) {
             val pkg = event.packageName?.toString()
             val cfg = pkg?.let { AppRegistry.map[it] }
             if (cfg !== currentConfig) {
                 currentConfig = cfg
-                isTypingInProgress = false    // reset typing on app switch
+                isTypingInProgress = false    // allow new typing on new screen
                 val status = if (cfg != null) "supported" else "ignored"
                 Log.d(TAG, "Config switched: $pkg → $status")
             }
         }
 
-        // Only when active and no typing in progress
+        // Skip if not active or already typed on this screen
         if (!serviceActive || isTypingInProgress) return
         val cfg = currentConfig ?: return
 
-        // On content change or focus, find input and type
+        // On content change or focus, simulate typing once
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
             event.eventType == AccessibilityEvent.TYPE_VIEW_FOCUSED) {
 
@@ -170,7 +160,8 @@ class HumanLikeTypingService : AccessibilityService() {
     }
 
     private fun simulateTypingAndSend(node: AccessibilityNodeInfo, cfg: AppConfig) {
-        isTypingInProgress = true    // typing started
+        isTypingInProgress = true    // prevent repeat on same screen
+
         node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
         node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         val text = sentences.firstOrNull()?.text.orEmpty()
@@ -217,13 +208,11 @@ class HumanLikeTypingService : AccessibilityService() {
                     if (list.isNotEmpty()) {
                         list.first().performAction(AccessibilityNodeInfo.ACTION_CLICK)
                         Log.d(TAG, "Clicked send-button id=$id")
-                        isTypingInProgress = false    // clear after send
                         return@let
                     }
                 }
                 node.performAction(AccessibilityNodeInfo.ACTION_NEXT_HTML_ELEMENT)
                 Log.d(TAG, "Fallback send via IME action")
-                isTypingInProgress = false    // clear on fallback
             }
         }, sendDelay)
     }
