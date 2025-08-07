@@ -61,6 +61,14 @@ class TypingSettingsFragment : PreferenceFragmentCompat() {
         }
         screen.addPreference(debugCat)
 
+        val overlaySw = SwitchPreferenceCompat(ctx).apply {
+            key = HumanLikeTypingService.PREF_DEBUG_OVERLAY
+            title = getString(R.string.pref_debug_overlay_title)
+            summary = getString(R.string.pref_debug_overlay_summary)
+            setDefaultValue(false)
+        }
+        debugCat.addPreference(overlaySw)
+
         val dumpBtn = Preference(ctx).apply {
             title = getString(R.string.pref_dump_hierarchy_title)
             summary = getString(R.string.pref_dump_hierarchy_summary)

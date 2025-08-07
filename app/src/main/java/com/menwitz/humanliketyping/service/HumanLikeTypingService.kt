@@ -8,6 +8,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.*
+import android.graphics.Color
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
@@ -15,8 +16,12 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Gravity
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.TextView
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.preference.PreferenceManager
@@ -26,6 +31,7 @@ import com.menwitz.humanliketyping.config.AppRegistry
 import com.menwitz.humanliketyping.data.model.SentenceEntry
 import com.menwitz.humanliketyping.data.repository.SentenceRepository
 import com.menwitz.humanliketyping.ui.settings.TypingSettingsActivity
+import kotlin.math.max
 import kotlin.random.Random
 
 private const val TAG = "HLTService"
@@ -43,42 +49,103 @@ class HumanLikeTypingService : AccessibilityService() {
 
         // Input handling modes
         const val MODE_SKIP   = "skip"
-        const val MODE_CLEAR  = "clear"   // <- NEW DEFAULT
+        const val MODE_CLEAR  = "clear"   // default
         const val MODE_APPEND = "append"
         const val PREF_INPUT_HANDLING = "input_handling_mode"
 
         // Per-app toggle key prefix
-        private const val KEY_APP_ENABLED_PREFIX = "app_enabled_"
+        const val KEY_APP_ENABLED_PREFIX = "app_enabled_"
+
+        // Debug overlay toggle
+        const val PREF_DEBUG_OVERLAY = "debug_overlay"
     }
+
+    // Ignore IME packages (keyboard windows spam events)
+    private val IME_PACKAGES = setOf(
+        "com.google.android.inputmethod.latin",
+        "com.microsoft.inputmethod.latin",
+        "com.touchtype.swiftkey",
+        "com.samsung.android.honeyboard",
+        "com.baidu.input",
+        "jp.co.omronsoft.openwnn"
+    )
 
     private var currentConfig: AppConfig? = null
     private var currentPkg: String? = null
+    private var currentWindowId: Int? = null
 
     private lateinit var prefs: SharedPreferences
     private lateinit var sentences: List<SentenceEntry>
 
     private var serviceActive = false
-    private var isTypingInProgress = false      // single-run guard per screen
-    private var lastIncomingSignature: String? = null  // to avoid re-reading same bubbles
+    private var isTypingInProgress = false  // while we’re actually typing/sending
+    private var typedThisWindow = false     // one-shot latch per window
+    private var lastIncomingSignature: String? = null
 
     private val handler = Handler(Looper.getMainLooper())
+    private val scanDelayMs = 120L
+
+    // ───────────── debug overlay members ─────────────
+    private var wm: WindowManager? = null
+    private var overlayView: TextView? = null
+    private val overlayUpdater = Runnable { refreshOverlayText() }
+
+    private val scanRunnable = Runnable {
+        if (!serviceActive || isTypingInProgress || typedThisWindow) return@Runnable
+        val cfg = currentConfig ?: return@Runnable
+        val root = rootInActiveWindow ?: return@Runnable
+        if (currentPkg in IME_PACKAGES) return@Runnable
+
+        extractLatestIncomingText(root, cfg)?.let { latest ->
+            Log.d(TAG, "Latest incoming ($currentPkg): $latest")
+        }
+
+        findInputNode(root, cfg)?.let { input ->
+            Log.d(TAG, "scan: input found in $currentPkg → type+send")
+            simulateTypingAndSend(input, cfg)
+        } ?: Log.d(TAG, "scan: no input found for $currentPkg")
+
+        scheduleOverlayUpdate()
+    }
 
     private val controlReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
             prefs = PreferenceManager.getDefaultSharedPreferences(this@HumanLikeTypingService)
             serviceActive = prefs.getBoolean("service_active", false)
             when (intent.action) {
-                ACTION_START -> if (serviceActive) showStatusNotification()
-                ACTION_STOP  -> NotificationManagerCompat.from(this@HumanLikeTypingService).cancel(NOTIF_ID)
+                ACTION_START -> {
+                    if (serviceActive) {
+                        showStatusNotification()
+                        scheduleScan()
+                        ensureOverlayVisibility()
+                        scheduleOverlayUpdate()
+                    }
+                }
+                ACTION_STOP  -> {
+                    handler.removeCallbacksAndMessages(null)
+                    isTypingInProgress = false
+                    typedThisWindow = false
+                    NotificationManagerCompat.from(this@HumanLikeTypingService).cancel(NOTIF_ID)
+                    removeOverlay()
+                }
                 ACTION_DUMP_HIERARCHY -> debugDumpWindow()
             }
+        }
+    }
+
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == PREF_DEBUG_OVERLAY) {
+            ensureOverlayVisibility()
+            scheduleOverlayUpdate()
         }
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         prefs     = PreferenceManager.getDefaultSharedPreferences(this)
+        prefs.registerOnSharedPreferenceChangeListener(prefListener)
         sentences = SentenceRepository.loadDefault(this)
+        wm = getSystemService(WINDOW_SERVICE) as WindowManager
 
         registerReceiver(
             controlReceiver,
@@ -91,69 +158,65 @@ class HumanLikeTypingService : AccessibilityService() {
         )
 
         serviceInfo = AccessibilityServiceInfo().apply {
-            eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
-                    AccessibilityEvent.TYPE_VIEW_FOCUSED or
-                    AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+            eventTypes =
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                        AccessibilityEvent.TYPE_VIEW_FOCUSED or
+                        AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             notificationTimeout = 50
-            flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
+            flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+                    AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
         }
 
         serviceActive = prefs.getBoolean("service_active", false)
-        if (serviceActive) showStatusNotification()
+        if (serviceActive) {
+            showStatusNotification()
+            ensureOverlayVisibility()
+            scheduleOverlayUpdate()
+        }
         Log.d(TAG, "onServiceConnected(): serviceActive=$serviceActive")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        // Track package + reset guards when screen/app changes
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-            event.eventType == AccessibilityEvent.TYPE_VIEW_FOCUSED) {
+        val pkg = event.packageName?.toString()
+        if (pkg != null && pkg in IME_PACKAGES) return
 
-            val pkg = event.packageName?.toString()
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            currentWindowId = event.windowId
+            typedThisWindow = false
+            isTypingInProgress = false
+            lastIncomingSignature = null
+
+            currentPkg = pkg
             val cfg = pkg?.let { AppRegistry.map[it] }
-
-            // Per-app toggle
             if (pkg != null && cfg != null && !isAppEnabled(pkg)) {
-                currentPkg = pkg
                 currentConfig = null
-                isTypingInProgress = false
-                lastIncomingSignature = null
-                Log.d(TAG, "Config switched: $pkg → disabled")
-                return
+                Log.d(TAG, "Window changed → $pkg (disabled)")
+            } else {
+                currentConfig = cfg
+                val status = when {
+                    cfg == null      -> "ignored"
+                    pkg == null      -> "unknown"
+                    isAppEnabled(pkg)-> "supported"
+                    else             -> "disabled"
+                }
+                Log.d(TAG, "Window changed → $pkg ($status)")
             }
 
-            if (cfg !== currentConfig || pkg != currentPkg) {
-                currentPkg = pkg
-                currentConfig = cfg
-                isTypingInProgress = false
-                lastIncomingSignature = null
-                val status = when {
-                    cfg == null -> "ignored"
-                    pkg != null && isAppEnabled(pkg) -> "supported"
-                    else -> "disabled"
-                }
-                Log.d(TAG, "Config switched: $pkg → $status")
-            }
+            scheduleScan()
+            scheduleOverlayUpdate()
+            return
         }
 
-        if (!serviceActive || isTypingInProgress) return
-        val cfg = currentConfig ?: return
+        if (!serviceActive) return
+        if (currentConfig == null) return
+        if (typedThisWindow || isTypingInProgress) return
 
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
-            event.eventType == AccessibilityEvent.TYPE_VIEW_FOCUSED) {
-
-            rootInActiveWindow?.let { root ->
-                // 1) Read latest incoming message for the model (if any)
-                extractLatestIncomingText(root, cfg)?.let { latest ->
-                    Log.d(TAG, "Latest incoming (for $currentPkg): $latest")
-                    // TODO: feed to generator when we plug the on-device model
-                }
-
-                // 2) Find input and type
-                findInputNode(root, cfg)?.let { input ->
-                    Log.d(TAG, "Detected input in ${currentPkg}")
-                    simulateTypingAndSend(input, cfg)
-                }
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_VIEW_FOCUSED,
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                scheduleScan()
+                scheduleOverlayUpdate()
             }
         }
     }
@@ -161,132 +224,147 @@ class HumanLikeTypingService : AccessibilityService() {
     override fun onInterrupt() {
         handler.removeCallbacksAndMessages(null)
         isTypingInProgress = false
+        scheduleOverlayUpdate()
     }
 
     override fun onDestroy() {
-        unregisterReceiver(controlReceiver)
+        try { unregisterReceiver(controlReceiver) } catch (_: Throwable) {}
+        try { prefs.unregisterOnSharedPreferenceChangeListener(prefListener) } catch (_: Throwable) {}
+        removeOverlay()
         super.onDestroy()
     }
 
     // ───────────────────────────────── helpers ─────────────────────────────────
 
     private fun isAppEnabled(packageName: String): Boolean {
-        // default true: all apps enabled by default
         return prefs.getBoolean(KEY_APP_ENABLED_PREFIX + packageName, true)
     }
 
+    private fun scheduleScan() {
+        handler.removeCallbacks(scanRunnable)
+        handler.postDelayed(scanRunnable, scanDelayMs)
+    }
+
     private fun debugDumpWindow() {
-        rootInActiveWindow?.let { root ->
-            fun traverse(node: AccessibilityNodeInfo, indent: String = "") {
-                val id  = node.viewIdResourceName ?: "<no-id>"
-                val cls = node.className ?: "<no-class>"
-                val txt = node.text ?: ""
-                Log.d(TAG, "$indent$id [$cls] text='$txt'")
-                for (i in 0 until node.childCount) {
-                    node.getChild(i)?.let { traverse(it, indent + "  ") }
-                }
-            }
-            traverse(root)
+        val root = rootInActiveWindow ?: return
+        fun traverse(node: AccessibilityNodeInfo, indent: String = "") {
+            val id  = node.viewIdResourceName ?: "<no-id>"
+            val cls = node.className ?: "<no-class>"
+            val txt = node.text ?: ""
+            Log.d(TAG, "$indent$id [$cls] text='$txt'")
+            for (i in 0 until node.childCount) node.getChild(i)?.let { traverse(it, indent + "  ") }
         }
+        Log.d(TAG, "---- WINDOW HIERARCHY (${currentPkg}) ----")
+        traverse(root)
+        toast("Hierarchy dumped to logcat")
     }
 
     private fun findInputNode(root: AccessibilityNodeInfo, cfg: AppConfig): AccessibilityNodeInfo? {
         for (id in cfg.inputIds) {
-            val list = root.findAccessibilityNodeInfosByViewId(id)
-            if (list.isNotEmpty()) return list.first()
+            try {
+                val list = root.findAccessibilityNodeInfosByViewId(id)
+                if (list.isNotEmpty()) return list.first()
+            } catch (_: Throwable) {}
         }
-        // Fallback by class scan
-        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
-        while (queue.isNotEmpty()) {
-            val node = queue.removeFirst()
-            if (node.className == cfg.inputClass) return node
-            for (i in 0 until node.childCount) node.getChild(i)?.let { queue.add(it) }
+        val q = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+        while (q.isNotEmpty()) {
+            val n = q.removeFirst()
+            if (n.className == cfg.inputClass) return n
+            for (i in 0 until n.childCount) n.getChild(i)?.let { q.add(it) }
         }
         return null
     }
 
-    /**
-     * Extract the latest incoming message text using configured bubble TextView IDs.
-     * Avoids re-emitting the same message by caching a simple signature.
-     */
     private fun extractLatestIncomingText(root: AccessibilityNodeInfo, cfg: AppConfig): String? {
         if (cfg.messageTextIds.isEmpty()) return null
-
         val texts = mutableListOf<CharSequence>()
         for (id in cfg.messageTextIds) {
-            val nodes = root.findAccessibilityNodeInfosByViewId(id)
-            for (n in nodes) {
-                n.text?.takeIf { it.isNotBlank() }?.let { texts.add(it) }
-            }
+            try {
+                val nodes = root.findAccessibilityNodeInfosByViewId(id)
+                for (n in nodes) n.text?.takeIf { it.isNotBlank() }?.let { texts.add(it) }
+            } catch (_: Throwable) {}
         }
         if (texts.isEmpty()) return null
 
         val latest = texts.last().toString().trim()
         val sig = "${currentPkg}|${latest.hashCode()}|${texts.size}"
-
         if (sig == lastIncomingSignature) return null
         lastIncomingSignature = sig
         return latest
     }
 
-    private fun simulateTypingAndSend(node: AccessibilityNodeInfo, cfg: AppConfig) {
-        // guard: only once per screen
-        isTypingInProgress = true
+    // ───────────────── typing & send (exactly once per window) ─────────────────
 
-        val mode = prefs.getString(PREF_INPUT_HANDLING, MODE_CLEAR) ?: MODE_CLEAR // default CLEAR
+    private fun simulateTypingAndSend(node: AccessibilityNodeInfo, cfg: AppConfig) {
+        if (typedThisWindow || isTypingInProgress) return
+        typedThisWindow = true
+        isTypingInProgress = true
+        scheduleOverlayUpdate()
+
+        val mode = prefs.getString(PREF_INPUT_HANDLING, MODE_CLEAR) ?: MODE_CLEAR
         val existing = node.text?.toString().orEmpty()
 
         when (mode) {
-            MODE_SKIP -> if (existing.isNotBlank()) return
+            MODE_SKIP -> {
+                if (existing.isNotBlank()) {
+                    Log.d(TAG, "MODE_SKIP: field non-empty → do nothing this window.")
+                    isTypingInProgress = false
+                    scheduleOverlayUpdate()
+                    return
+                }
+            }
             MODE_CLEAR -> {
                 val clearArgs = Bundle().apply {
                     putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
                 }
                 node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, clearArgs)
             }
-            MODE_APPEND -> { /* keep existing; we’ll append below */ }
+            MODE_APPEND -> { /* keep existing; append below */ }
         }
 
         node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
         node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
 
-        val text = sentences.firstOrNull()?.text.orEmpty()
-        var current = if (mode == MODE_APPEND && existing.isNotBlank()) existing + "\n" else ""
-        val backspaceIndex = if (text.length > 3) Random.nextInt(1, text.length - 1) else -1
-        var delayMs = 0L
+        val newText = sentences.firstOrNull()?.text.orEmpty()
+        if (newText.isEmpty()) {
+            Log.d(TAG, "No sentence to type; abort.")
+            isTypingInProgress = false
+            scheduleOverlayUpdate()
+            return
+        }
 
-        text.forEachIndexed { i, c ->
-            val charDelay = Random.nextLong(100, 300)
+        var current = if (mode == MODE_APPEND && existing.isNotBlank()) existing + "\n" else ""
+        var delayMs = 0L
+        val backspaceIndex = if (newText.length > 3) Random.nextInt(1, newText.length - 1) else -1
+
+        newText.forEachIndexed { i, c ->
+            val charDelay = Random.nextLong(90, 220)
             delayMs += charDelay
             handler.postDelayed({
                 current += c
-                val args = Bundle().apply {
-                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, current)
-                }
-                node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                setNodeText(node, current)
+                scheduleOverlayUpdate()
             }, delayMs)
 
             if (i == backspaceIndex) {
-                val bsDelay = delayMs + Random.nextLong(200, 400)
+                val bsDelay = delayMs + Random.nextLong(180, 320)
                 handler.postDelayed({
-                    val truncated = current.dropLast(1)
-                    val args = Bundle().apply {
-                        putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, truncated)
+                    if (current.isNotEmpty()) {
+                        current = current.dropLast(1)
+                        setNodeText(node, current)
+                        scheduleOverlayUpdate()
                     }
-                    node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
                 }, bsDelay)
                 handler.postDelayed({
                     current += c
-                    val args = Bundle().apply {
-                        putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, current)
-                    }
-                    node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-                }, bsDelay + Random.nextLong(100, 200))
-                delayMs = bsDelay + 100
+                    setNodeText(node, current)
+                    scheduleOverlayUpdate()
+                }, bsDelay + Random.nextLong(90, 160))
+                delayMs = max(delayMs, bsDelay + 100)
             }
         }
 
-        val sendDelay = delayMs + Random.nextLong(300, 700)
+        val sendDelay = delayMs + Random.nextLong(260, 520)
         handler.postDelayed({
             val sent = trySend(rootInActiveWindow, node, cfg)
             Log.d(TAG, when (sent) {
@@ -297,8 +375,20 @@ class HumanLikeTypingService : AccessibilityService() {
                 SendResult.IME_FALLBACK      -> "Send: IME fallback"
                 SendResult.FAILED            -> "Send: failed (no control found)"
             })
-            // Keep isTypingInProgress=true until screen changes (prevents re-runs)
+            // Keep isTypingInProgress=true; we only re-enable on window change.
+            scheduleOverlayUpdate()
         }, sendDelay)
+    }
+
+    private fun setNodeText(node: AccessibilityNodeInfo, value: String) {
+        val args = Bundle().apply {
+            putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                value
+            )
+        }
+        val ok = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        if (!ok) Log.d(TAG, "ACTION_SET_TEXT failed once (may succeed later)")
     }
 
     // ───────────────────────── robust send paths ─────────────────────────
@@ -308,25 +398,23 @@ class HumanLikeTypingService : AccessibilityService() {
     private fun trySend(root: AccessibilityNodeInfo?, inputNode: AccessibilityNodeInfo, cfg: AppConfig): SendResult {
         root ?: return SendResult.FAILED
 
-        // 1) Explicit send IDs
         for (id in cfg.sendButtonIds) {
-            val list = root.findAccessibilityNodeInfosByViewId(id)
-            if (list.isNotEmpty()) {
-                val node = list.first()
-                if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return SendResult.CLICKED_ID
-                firstClickableAncestor(node)?.let { anc ->
-                    if (anc.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return SendResult.CLICKED_ANCESTOR
+            try {
+                val list = root.findAccessibilityNodeInfosByViewId(id)
+                if (list.isNotEmpty()) {
+                    val node = list.first()
+                    if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return SendResult.CLICKED_ID
+                    firstClickableAncestor(node)?.let { anc ->
+                        if (anc.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return SendResult.CLICKED_ANCESTOR
+                    }
+                    if (tapCenter(node)) return SendResult.TAP_GESTURE
                 }
-                // Try gesture on this node’s bounds
-                if (tapCenter(node)) return SendResult.TAP_GESTURE
-            }
+            } catch (_: Throwable) {}
         }
 
-        // 2) Content-desc or text matches like "Send"
         val candidate = findFirst(root) { n ->
             val cd = n.contentDescription?.toString()?.lowercase() ?: ""
             val tx = n.text?.toString()?.lowercase() ?: ""
-            // Expand this list over time if needed (localize later)
             (cd.contains("send") || tx == "send" || tx.contains("send")) && n.isVisibleToUser
         }
         if (candidate != null) {
@@ -337,7 +425,6 @@ class HumanLikeTypingService : AccessibilityService() {
             if (tapCenter(candidate)) return SendResult.TAP_GESTURE
         }
 
-        // 3) Last resort: IME-ish fallback (some fields send on newline)
         val args = Bundle().apply {
             val current = inputNode.text?.toString().orEmpty()
             putCharSequence(
@@ -369,15 +456,10 @@ class HumanLikeTypingService : AccessibilityService() {
         node.getBoundsInScreen(r)
         if (r.isEmpty) return false
 
-        val path = Path().apply {
-            moveTo(r.exactCenterX(), r.exactCenterY())
-        }
+        val path = Path().apply { moveTo(r.exactCenterX(), r.exactCenterY()) }
         val stroke = GestureDescription.StrokeDescription(path, 0, 30)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        var result = false
-        // dispatchGesture must run on main; we're already on main
-        result = dispatchGesture(gesture, null, null)
-        return result
+        return dispatchGesture(gesture, null, null)
     }
 
     private inline fun findFirst(root: AccessibilityNodeInfo, predicate: (AccessibilityNodeInfo) -> Boolean): AccessibilityNodeInfo? {
@@ -388,6 +470,75 @@ class HumanLikeTypingService : AccessibilityService() {
             for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
         }
         return null
+    }
+
+    private fun toast(msg: String) {
+        try { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() } catch (_: Throwable) {}
+    }
+
+    // ───────────────────────── overlay helpers ─────────────────────────
+
+    private fun ensureOverlayVisibility() {
+        if (!prefs.getBoolean(PREF_DEBUG_OVERLAY, false)) {
+            removeOverlay()
+            return
+        }
+        if (overlayView != null) return
+
+        val params = WindowManager.LayoutParams().apply {
+            width = WindowManager.LayoutParams.WRAP_CONTENT
+            height = WindowManager.LayoutParams.WRAP_CONTENT
+            gravity = Gravity.TOP or Gravity.START
+            x = 12
+            y = 12
+            flags = (WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                    or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                type = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+            } else {
+                @Suppress("DEPRECATION")
+                type = WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
+            }
+        }
+
+        overlayView = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setBackgroundColor(0x88000000.toInt())
+            setPadding(12, 10, 12, 10)
+            textSize = 12f
+            text = "HLT overlay"
+        }
+        try {
+            wm?.addView(overlayView, params)
+        } catch (t: Throwable) {
+            overlayView = null
+            Log.w(TAG, "Failed to add overlay: ${t.message}")
+        }
+    }
+
+    private fun removeOverlay() {
+        val v = overlayView ?: return
+        try { wm?.removeView(v) } catch (_: Throwable) {}
+        overlayView = null
+    }
+
+    private fun scheduleOverlayUpdate() {
+        if (overlayView == null) return
+        handler.removeCallbacks(overlayUpdater)
+        handler.postDelayed(overlayUpdater, 50L)
+    }
+
+    private fun refreshOverlayText() {
+        val v = overlayView ?: return
+        val info = buildString {
+            appendLine("pkg=${currentPkg ?: "none"}")
+            appendLine("win=${currentWindowId ?: -1}")
+            appendLine("active=$serviceActive")
+            appendLine("typedThisWin=$typedThisWindow")
+            appendLine("typing=$isTypingInProgress")
+        }
+        v.text = info
     }
 
     // ───────────────────────── notification ─────────────────────────

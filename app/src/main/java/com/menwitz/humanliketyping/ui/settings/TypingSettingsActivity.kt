@@ -7,7 +7,6 @@ import com.menwitz.humanliketyping.R
 class TypingSettingsActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Simple container; Fragment will render a PreferenceScreen
         supportFragmentManager
             .beginTransaction()
             .replace(android.R.id.content, TypingSettingsFragment())

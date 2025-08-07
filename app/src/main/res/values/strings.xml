@@ -42,4 +42,7 @@
     <string name="pref_dump_hierarchy_summary">
         Writes the current screen’s Accessibility tree to Logcat (tag: HLTService)
     </string>
+
+    <string name="pref_debug_overlay_title">Show debug overlay</string>
+    <string name="pref_debug_overlay_summary">Display current window, flags, and latch state on screen</string>
 </resources>
