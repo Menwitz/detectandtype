@@ -17,7 +17,7 @@ class TypingSettingsFragment : PreferenceFragmentCompat() {
 
         val screen = preferenceManager.createPreferenceScreen(ctx)
 
-        // 1) Input handling mode (Skip / Clear / Append)
+        // 1) Input handling mode (default = CLEAR)
         val modeList = ListPreference(ctx).apply {
             key = HumanLikeTypingService.PREF_INPUT_HANDLING
             title = getString(R.string.pref_input_mode_title)
@@ -29,14 +29,14 @@ class TypingSettingsFragment : PreferenceFragmentCompat() {
             )
             entryValues = arrayOf(
                 HumanLikeTypingService.MODE_SKIP,
-                HumanLikeTypingService.MODE_CLEAR,
+                HumanLikeTypingService.MODE_CLEAR,   // default
                 HumanLikeTypingService.MODE_APPEND
             )
-            setDefaultValue(HumanLikeTypingService.MODE_SKIP)
+            setDefaultValue(HumanLikeTypingService.MODE_CLEAR)
         }
         screen.addPreference(modeList)
 
-        // 2) Per-app toggles
+        // 2) Per-app toggles (default enabled = true)
         val appsCat = PreferenceCategory(ctx).apply {
             title = getString(R.string.pref_cat_apps_title)
         }
@@ -50,12 +50,12 @@ class TypingSettingsFragment : PreferenceFragmentCompat() {
                 summary = pkg
                 isIconSpaceReserved = true
                 icon?.let { this.icon = it }
-                setDefaultValue(true)
+                setDefaultValue(true) // enabled by default
             }
             appsCat.addPreference(sw)
         }
 
-        // 3) Debug action: dump accessibility hierarchy to Logcat
+        // 3) Debug: dump hierarchy
         val debugCat = PreferenceCategory(ctx).apply {
             title = getString(R.string.pref_cat_debug_title)
         }
