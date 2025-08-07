@@ -1,0 +1,30 @@
+<resources>
+    <string name="app_name">humanliketyping</string>
+    <string name="title_activity_settings">SettingsActivity</string>
+
+    <!-- Preference Titles -->
+    <string name="messages_header">Messages</string>
+    <string name="sync_header">Sync</string>
+
+    <!-- Messages Preferences -->
+    <string name="signature_title">Your signature</string>
+    <string name="reply_title">Default reply action</string>
+
+    <!-- Sync Preferences -->
+    <string name="sync_title">Sync email periodically</string>
+    <string name="attachment_title">Download incoming attachments</string>
+    <string name="attachment_summary_on">Automatically download attachments for incoming emails
+    </string>
+    <string name="attachment_summary_off">Only download attachments when manually requested</string>
+
+    <string name="settings_title">Sentence and Typing Settings</string>
+    <string name="hint_sentence">Type sentence…</string>
+    <string name="add_sentence">Add sentence</string>
+    <string name="delete_sentence">Delete sentence</string>
+    <string name="keystroke_min_delay">Keystroke Min Delay (ms)</string>
+    <string name="keystroke_max_delay">Keystroke Max Delay (ms)</string>
+    <string name="pause_between_words_min">Pause Between Words Min (ms)</string>
+    <string name="pause_between_words_max">Pause Between Words Max (ms)</string>
+    <string name="use_direct_injection">Use Direct Text Injection</string>
+    <string name="sentences_saved">Sentences saved</string>
+</resources>

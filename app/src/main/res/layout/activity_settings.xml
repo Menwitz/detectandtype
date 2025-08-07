@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:padding="16dp">
+
+    <LinearLayout
+        android:orientation="vertical"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <!-- Keystroke Min Delay -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/keystroke_min_delay"/>
+
+        <SeekBar
+            android:id="@+id/sbMinDelay"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="1000"/>
+
+        <TextView
+            android:id="@+id/tvMinDelayValue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="100"/>
+
+        <!-- Keystroke Max Delay -->
+        <TextView
+            android:layout_marginTop="8dp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/keystroke_max_delay"/>
+
+        <SeekBar
+            android:id="@+id/sbMaxDelay"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="2000"/>
+
+        <TextView
+            android:id="@+id/tvMaxDelayValue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="300"/>
+
+        <!-- Pause Between Words Min -->
+        <TextView
+            android:layout_marginTop="8dp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/pause_between_words_min"/>
+
+        <SeekBar
+            android:id="@+id/sbWordPauseMin"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="3000"/>
+
+        <TextView
+            android:id="@+id/tvWordPauseMinValue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="300"/>
+
+        <!-- Pause Between Words Max -->
+        <TextView
+            android:layout_marginTop="8dp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/pause_between_words_max"/>
+
+        <SeekBar
+            android:id="@+id/sbWordPauseMax"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="5000"/>
+
+        <TextView
+            android:id="@+id/tvWordPauseMaxValue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="600"/>
+
+        <!-- Direct Injection Toggle -->
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/switchInjection"
+            android:layout_marginTop="12dp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/use_direct_injection"/>
+
+    </LinearLayout>
+</ScrollView>
