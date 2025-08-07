@@ -6,7 +6,11 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.*
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -29,18 +33,20 @@ private const val TAG = "HLTService"
 
 class HumanLikeTypingService : AccessibilityService() {
     companion object {
-        const val ACTION_START = "com.menwitz.humanliketyping.START_SERVICE"
-        const val ACTION_STOP  = "com.menwitz.humanliketyping.STOP_SERVICE"
-        private const val CHANNEL_ID = "typing_status_channel"
-        private const val CHANNEL_NAME = "Typing Service Status"
-        private const val NOTIF_ID = 1001
+        const val ACTION_START          = "com.menwitz.humanliketyping.START_SERVICE"
+        const val ACTION_STOP           = "com.menwitz.humanliketyping.STOP_SERVICE"
+        const val ACTION_DUMP_HIERARCHY = "com.menwitz.humanliketyping.DUMP_HIERARCHY"
+        private const val CHANNEL_ID    = "typing_status_channel"
+        private const val CHANNEL_NAME  = "Typing Service Status"
+        private const val NOTIF_ID      = 1001
     }
 
     private var currentConfig: AppConfig? = null
-    private val handler = Handler(Looper.getMainLooper())
     private lateinit var prefs: SharedPreferences
     private lateinit var sentences: List<SentenceEntry>
     private var serviceActive = false
+    private var isTypingInProgress = false    // guard flag
+    private val handler = Handler(Looper.getMainLooper())
 
     private val controlReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
@@ -48,13 +54,17 @@ class HumanLikeTypingService : AccessibilityService() {
             serviceActive = prefs.getBoolean("service_active", false)
             when (intent.action) {
                 ACTION_START -> {
-                    Log.d(TAG, "Received START; serviceActive=$serviceActive")
+                    Log.d(TAG, "START received; serviceActive=$serviceActive")
                     if (serviceActive) showStatusNotification()
                 }
                 ACTION_STOP -> {
-                    Log.d(TAG, "Received STOP; serviceActive=$serviceActive")
+                    Log.d(TAG, "STOP received; serviceActive=$serviceActive")
                     NotificationManagerCompat.from(this@HumanLikeTypingService)
                         .cancel(NOTIF_ID)
+                }
+                ACTION_DUMP_HIERARCHY -> {
+                    Log.d(TAG, "DUMP_HIERARCHY received")
+                    debugDumpWindow()
                 }
             }
         }
@@ -70,6 +80,7 @@ class HumanLikeTypingService : AccessibilityService() {
             IntentFilter().apply {
                 addAction(ACTION_START)
                 addAction(ACTION_STOP)
+                addAction(ACTION_DUMP_HIERARCHY)
             },
             Context.RECEIVER_NOT_EXPORTED
         )
@@ -89,26 +100,30 @@ class HumanLikeTypingService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        // update config
+        // Update which app config to use
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
             event.eventType == AccessibilityEvent.TYPE_VIEW_FOCUSED) {
             val pkg = event.packageName?.toString()
             val cfg = pkg?.let { AppRegistry.map[it] }
             if (cfg !== currentConfig) {
                 currentConfig = cfg
-                val status = if (cfg!=null) "supported" else "ignored"
-                Log.d(TAG, "Switched config: $pkg → $status")
+                isTypingInProgress = false    // reset typing on app switch
+                val status = if (cfg != null) "supported" else "ignored"
+                Log.d(TAG, "Config switched: $pkg → $status")
             }
         }
 
-        if (!serviceActive) return
+        // Only when active and no typing in progress
+        if (!serviceActive || isTypingInProgress) return
         val cfg = currentConfig ?: return
 
+        // On content change or focus, find input and type
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
             event.eventType == AccessibilityEvent.TYPE_VIEW_FOCUSED) {
+
             rootInActiveWindow?.let { root ->
                 findInputNode(root, cfg)?.let { input ->
-                    Log.d(TAG, "Typing into ${cfg.inputClass} in ${event.packageName}")
+                    Log.d(TAG, "Detected input in ${event.packageName}")
                     simulateTypingAndSend(input, cfg)
                 }
             }
@@ -117,6 +132,7 @@ class HumanLikeTypingService : AccessibilityService() {
 
     override fun onInterrupt() {
         handler.removeCallbacksAndMessages(null)
+        isTypingInProgress = false    // clear on interrupt
     }
 
     override fun onDestroy() {
@@ -124,120 +140,105 @@ class HumanLikeTypingService : AccessibilityService() {
         super.onDestroy()
     }
 
+    private fun debugDumpWindow() {
+        rootInActiveWindow?.let { root ->
+            fun traverse(node: AccessibilityNodeInfo, indent: String = "") {
+                val id  = node.viewIdResourceName ?: "<no-id>"
+                val cls = node.className ?: "<no-class>"
+                val txt = node.text ?: ""
+                Log.d(TAG, "$indent$id [$cls] text='$txt'")
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { traverse(it, indent + "  ") }
+                }
+            }
+            traverse(root)
+        }
+    }
+
+    private fun findInputNode(root: AccessibilityNodeInfo, cfg: AppConfig): AccessibilityNodeInfo? {
+        for (id in cfg.inputIds) {
+            val list = root.findAccessibilityNodeInfosByViewId(id)
+            if (list.isNotEmpty()) return list.first()
+        }
+        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            if (node.className == cfg.inputClass) return node
+            for (i in 0 until node.childCount) node.getChild(i)?.let { queue.add(it) }
+        }
+        return null
+    }
+
     private fun simulateTypingAndSend(node: AccessibilityNodeInfo, cfg: AppConfig) {
-        // 1) focus & click
+        isTypingInProgress = true    // typing started
         node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
         node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-
-        // 2) prepare text
         val text = sentences.firstOrNull()?.text.orEmpty()
         var current = ""
+        val backspaceIndex = if (text.length > 3) Random.nextInt(1, text.length - 1) else -1
+        var delayMs = 0L
 
-        // pick a random index for a single backspace correction
-        val backspaceIndex = if (text.length>3) Random.nextInt(1, text.length-1) else -1
-
-        // 3) simulate each keystroke
-        var cumulativeDelay = 0L
-        for ((i, c) in text.withIndex()) {
-            val delay = Random.nextLong(100, 300)
-            cumulativeDelay += delay
-
-            // type character
+        text.forEachIndexed { i, c ->
+            val charDelay = Random.nextLong(100, 300)
+            delayMs += charDelay
             handler.postDelayed({
                 current += c
                 val args = Bundle().apply {
-                    putCharSequence(
-                        AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                        current
-                    )
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, current)
                 }
                 node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-            }, cumulativeDelay)
+            }, delayMs)
 
-            // occasional backspace
             if (i == backspaceIndex) {
-                val bsDelay = cumulativeDelay + Random.nextLong(200, 400)
-                // remove last char
+                val bsDelay = delayMs + Random.nextLong(200, 400)
                 handler.postDelayed({
                     val truncated = current.dropLast(1)
                     val args = Bundle().apply {
-                        putCharSequence(
-                            AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                            truncated
-                        )
+                        putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, truncated)
                     }
                     node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
                 }, bsDelay)
-                // retype char
                 handler.postDelayed({
                     current += c
                     val args = Bundle().apply {
-                        putCharSequence(
-                            AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                            current
-                        )
+                        putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, current)
                     }
                     node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-                }, bsDelay + Random.nextLong(100,200))
-                cumulativeDelay = bsDelay + 100
+                }, bsDelay + Random.nextLong(100, 200))
+                delayMs = bsDelay + 100
             }
         }
 
-        // 4) after typing finishes, schedule send
-        val sendDelay = cumulativeDelay + Random.nextLong(300, 700)
+        val sendDelay = delayMs + Random.nextLong(300, 700)
         handler.postDelayed({
             rootInActiveWindow?.let { root ->
-                // try configured send-button IDs
                 for (id in cfg.sendButtonIds) {
                     val list = root.findAccessibilityNodeInfosByViewId(id)
                     if (list.isNotEmpty()) {
                         list.first().performAction(AccessibilityNodeInfo.ACTION_CLICK)
                         Log.d(TAG, "Clicked send-button id=$id")
+                        isTypingInProgress = false    // clear after send
                         return@let
                     }
                 }
-                // fallback: send via IME action
                 node.performAction(AccessibilityNodeInfo.ACTION_NEXT_HTML_ELEMENT)
                 Log.d(TAG, "Fallback send via IME action")
+                isTypingInProgress = false    // clear on fallback
             }
         }, sendDelay)
     }
 
-    private fun findInputNode(
-        root: AccessibilityNodeInfo,
-        cfg: AppConfig
-    ): AccessibilityNodeInfo? {
-        // try explicit IDs
-        for (id in cfg.inputIds) {
-            val list = root.findAccessibilityNodeInfosByViewId(id)
-            if (list.isNotEmpty()) return list.first()
-        }
-        // fallback to class scan
-        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
-        while (queue.isNotEmpty()) {
-            val node = queue.removeFirst()
-            if (node.className == cfg.inputClass) return node
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { queue.add(it) }
-            }
-        }
-        return null
-    }
-
     private fun showStatusNotification() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val chan = NotificationChannel(
-                CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW
-            ).apply { description = "Auto-typing is active" }
-            getSystemService(NotificationManager::class.java)
-                .createNotificationChannel(chan)
+            val chan = NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW)
+                .apply { description = "Auto-typing is active" }
+            getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
         }
         val pi = PendingIntent.getActivity(
             this, 0,
             Intent(this, SettingsActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK),
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-                PendingIntent.FLAG_IMMUTABLE else 0
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_IMMUTABLE else 0
         )
         val n = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
