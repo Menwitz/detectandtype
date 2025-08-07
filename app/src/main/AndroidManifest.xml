@@ -29,6 +29,11 @@
 
         <activity android:name=".ui.SentencesActivity"/>
 
+        <activity
+            android:name=".ui.settings.TypingSettingsActivity"
+            android:exported="false"
+            android:theme="@style/Theme.HumanLikeTyping" />
+
         <service
             android:name=".service.HumanLikeTypingService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"

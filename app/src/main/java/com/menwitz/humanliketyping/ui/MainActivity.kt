@@ -24,6 +24,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
+    private lateinit var btnSettings: Button
+    private lateinit var btnSentences: Button
+    private lateinit var btntyping: Button
 
     private val requestNotif = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -39,6 +42,9 @@ class MainActivity : AppCompatActivity() {
 
         btnStart = findViewById(R.id.btnStart)
         btnStop  = findViewById(R.id.btnStop)
+        btnSettings  = findViewById(R.id.btnSettings)
+        btnSentences  = findViewById(R.id.btnSentences)
+        btntyping  = findViewById(R.id.btnTyping)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             requestNotif.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -71,6 +77,19 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Auto-typing STOPPED", Toast.LENGTH_SHORT).show()
             Log.d(TAG, "Sent STOP broadcast; prefs service_active=false")
         }
+
+        btnSettings.setOnClickListener {
+            startActivity(Intent(this, com.menwitz.humanliketyping.ui.SettingsActivity::class.java))
+        }
+
+        btnSentences.setOnClickListener {
+            startActivity(Intent(this, com.menwitz.humanliketyping.ui.SentencesActivity::class.java))
+        }
+
+        btntyping.setOnClickListener {
+            startActivity(Intent(this, com.menwitz.humanliketyping.ui.settings.TypingSettingsActivity::class.java))
+        }
+
     }
 
     private fun isAccessibilityEnabled(): Boolean {

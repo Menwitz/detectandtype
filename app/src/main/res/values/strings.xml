@@ -17,7 +17,7 @@
     </string>
     <string name="attachment_summary_off">Only download attachments when manually requested</string>
 
-    <string name="settings_title">Sentence and Typing Settings</string>
+    <string name="settings_title">Sentence &amp; Typing Settings</string>
     <string name="hint_sentence">Type sentence…</string>
     <string name="add_sentence">Add sentence</string>
     <string name="delete_sentence">Delete sentence</string>
@@ -27,4 +27,19 @@
     <string name="pause_between_words_max">Pause Between Words Max (ms)</string>
     <string name="use_direct_injection">Use Direct Text Injection</string>
     <string name="sentences_saved">Sentences saved</string>
+
+    <string name="title_typing_settings">Typing &amp; Apps</string>
+
+    <string name="pref_input_mode_title">When input field already has text</string>
+    <string name="pref_input_mode_skip">Skip (do nothing)</string>
+    <string name="pref_input_mode_clear">Clear then type</string>
+    <string name="pref_input_mode_append">Append after newline</string>
+
+    <string name="pref_cat_apps_title">Enabled Apps</string>
+
+    <string name="pref_cat_debug_title">Debug</string>
+    <string name="pref_dump_hierarchy_title">Dump UI hierarchy to Logcat</string>
+    <string name="pref_dump_hierarchy_summary">
+        Writes the current screen’s Accessibility tree to Logcat (tag: HLTService)
+    </string>
 </resources>

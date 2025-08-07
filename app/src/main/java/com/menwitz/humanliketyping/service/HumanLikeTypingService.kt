@@ -39,13 +39,19 @@ class HumanLikeTypingService : AccessibilityService() {
         private const val CHANNEL_ID    = "typing_status_channel"
         private const val CHANNEL_NAME  = "Typing Service Status"
         private const val NOTIF_ID      = 1001
+
+        // Input handling modes
+        const val MODE_SKIP   = "skip"
+        const val MODE_CLEAR  = "clear"
+        const val MODE_APPEND = "append"
+        const val PREF_INPUT_HANDLING = "input_handling_mode"
     }
 
     private var currentConfig: AppConfig? = null
     private lateinit var prefs: SharedPreferences
     private lateinit var sentences: List<SentenceEntry>
     private var serviceActive = false
-    private var isTypingInProgress = false    // prevents repeat on same screen
+    private var isTypingInProgress = false    // prevent repeat on same screen
     private val handler = Handler(Looper.getMainLooper())
 
     private val controlReceiver = object : BroadcastReceiver() {
@@ -103,7 +109,7 @@ class HumanLikeTypingService : AccessibilityService() {
             }
         }
 
-        // Skip if not active or already typed on this screen
+        // Skip if not active or already typed here
         if (!serviceActive || isTypingInProgress) return
         val cfg = currentConfig ?: return
 
@@ -122,7 +128,7 @@ class HumanLikeTypingService : AccessibilityService() {
 
     override fun onInterrupt() {
         handler.removeCallbacksAndMessages(null)
-        isTypingInProgress = false    // clear on interrupt
+        isTypingInProgress = false
     }
 
     override fun onDestroy() {
@@ -160,12 +166,31 @@ class HumanLikeTypingService : AccessibilityService() {
     }
 
     private fun simulateTypingAndSend(node: AccessibilityNodeInfo, cfg: AppConfig) {
-        isTypingInProgress = true    // prevent repeat on same screen
+        // Prevent repeats on same screen
+        isTypingInProgress = true
+
+        // Input handling mode
+        val mode = prefs.getString(PREF_INPUT_HANDLING, MODE_SKIP) ?: MODE_SKIP
+        val existing = node.text?.toString().orEmpty()
+
+        when (mode) {
+            MODE_SKIP -> if (existing.isNotBlank()) return
+            MODE_CLEAR -> {
+                val clearArgs = Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
+                }
+                node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, clearArgs)
+            }
+            MODE_APPEND -> {
+                // keep existing before typing
+            }
+        }
 
         node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
         node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+
         val text = sentences.firstOrNull()?.text.orEmpty()
-        var current = ""
+        var current = if (mode == MODE_APPEND) existing + "\n" else ""
         val backspaceIndex = if (text.length > 3) Random.nextInt(1, text.length - 1) else -1
         var delayMs = 0L
 
