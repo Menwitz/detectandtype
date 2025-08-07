@@ -36,7 +36,39 @@ class TypingSettingsFragment : PreferenceFragmentCompat() {
         }
         screen.addPreference(modeList)
 
-        // 2) Per-app toggles (default enabled = true)
+        // 2) Require focus toggle
+        val reqFocus = SwitchPreferenceCompat(ctx).apply {
+            key = HumanLikeTypingService.PREF_REQUIRE_FOCUS
+            title = getString(R.string.pref_require_focus_title)
+            summary = getString(R.string.pref_require_focus_summary)
+            setDefaultValue(false) // default: we auto-focus
+        }
+        screen.addPreference(reqFocus)
+
+        // 3) Cooldown selector (per app)
+        val cooldown = ListPreference(ctx).apply {
+            key = HumanLikeTypingService.PREF_COOLDOWN_MS
+            title = getString(R.string.pref_cooldown_title)
+            summary = "%s"
+            entries = arrayOf(
+                getString(R.string.cooldown_off),
+                "5 s",
+                "10 s",
+                "30 s",
+                "60 s"
+            )
+            entryValues = arrayOf(
+                "0",
+                "5000",
+                "10000",
+                "30000",
+                "60000"
+            )
+            setDefaultValue("10000") // 10s
+        }
+        screen.addPreference(cooldown)
+
+        // 4) Per-app toggles (default enabled = true)
         val appsCat = PreferenceCategory(ctx).apply {
             title = getString(R.string.pref_cat_apps_title)
         }
@@ -55,7 +87,7 @@ class TypingSettingsFragment : PreferenceFragmentCompat() {
             appsCat.addPreference(sw)
         }
 
-        // 3) Debug: dump hierarchy
+        // 5) Debug: dump hierarchy
         val debugCat = PreferenceCategory(ctx).apply {
             title = getString(R.string.pref_cat_debug_title)
         }
