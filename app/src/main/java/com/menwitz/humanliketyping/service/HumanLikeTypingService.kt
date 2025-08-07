@@ -56,11 +56,10 @@ class HumanLikeTypingService : AccessibilityService() {
         // Per-app toggle key prefix
         const val KEY_APP_ENABLED_PREFIX = "app_enabled_"
 
-        // Debug overlay toggle
+        // Debug overlay toggle (optional)
         const val PREF_DEBUG_OVERLAY = "debug_overlay"
     }
 
-    // Ignore IME packages (keyboard windows spam events)
     private val IME_PACKAGES = setOf(
         "com.google.android.inputmethod.latin",
         "com.microsoft.inputmethod.latin",
@@ -78,14 +77,14 @@ class HumanLikeTypingService : AccessibilityService() {
     private lateinit var sentences: List<SentenceEntry>
 
     private var serviceActive = false
-    private var isTypingInProgress = false  // while we’re actually typing/sending
-    private var typedThisWindow = false     // one-shot latch per window
+    private var isTypingInProgress = false
+    private var typedThisWindow = false
     private var lastIncomingSignature: String? = null
 
     private val handler = Handler(Looper.getMainLooper())
     private val scanDelayMs = 120L
 
-    // ───────────── debug overlay members ─────────────
+    // ───────────── debug overlay (optional) ─────────────
     private var wm: WindowManager? = null
     private var overlayView: TextView? = null
     private val overlayUpdater = Runnable { refreshOverlayText() }
@@ -101,9 +100,9 @@ class HumanLikeTypingService : AccessibilityService() {
         }
 
         findInputNode(root, cfg)?.let { input ->
-            Log.d(TAG, "scan: input found in $currentPkg → type+send")
+            Log.d(TAG, "scan: editable input found in $currentPkg → type+send")
             simulateTypingAndSend(input, cfg)
-        } ?: Log.d(TAG, "scan: no input found for $currentPkg")
+        } ?: Log.d(TAG, "scan: no editable input found for $currentPkg")
 
         scheduleOverlayUpdate()
     }
@@ -134,7 +133,7 @@ class HumanLikeTypingService : AccessibilityService() {
     }
 
     private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-        if (key == PREF_DEBUG_OVERLAY) {
+        if (key == PREF_DEBUG_OVERLAY || key == PREF_INPUT_HANDLING) {
             ensureOverlayVisibility()
             scheduleOverlayUpdate()
         }
@@ -251,7 +250,7 @@ class HumanLikeTypingService : AccessibilityService() {
             val id  = node.viewIdResourceName ?: "<no-id>"
             val cls = node.className ?: "<no-class>"
             val txt = node.text ?: ""
-            Log.d(TAG, "$indent$id [$cls] text='$txt'")
+            Log.d(TAG, "$indent$id [$cls] text='$txt' editable=${node.isEditable} visible=${node.isVisibleToUser}")
             for (i in 0 until node.childCount) node.getChild(i)?.let { traverse(it, indent + "  ") }
         }
         Log.d(TAG, "---- WINDOW HIERARCHY (${currentPkg}) ----")
@@ -259,17 +258,55 @@ class HumanLikeTypingService : AccessibilityService() {
         toast("Hierarchy dumped to logcat")
     }
 
+    /** Return true if node supports ACTION_SET_TEXT (some apps don’t flag isEditable). */
+    private fun supportsSetText(node: AccessibilityNodeInfo): Boolean {
+        val mask = node.actions and AccessibilityNodeInfo.ACTION_SET_TEXT
+        if (mask != 0) return true
+        for (a in node.actionList) if (a.id == AccessibilityNodeInfo.ACTION_SET_TEXT) return true
+        return false
+    }
+
+    /** Editable + visible guard for candidate inputs. */
+    private fun isRealEditable(node: AccessibilityNodeInfo): Boolean {
+        return node.isVisibleToUser && (node.isEditable || supportsSetText(node))
+    }
+
+    /** Get hint text if exposed (API 26+) */
+    private fun getHint(node: AccessibilityNodeInfo): String? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) node.hintText?.toString() else null
+
+    /**
+     * Effective user-entered text (treat hints as empty).
+     * Many apps expose hint as text; compare against hint/contentDescription and trim.
+     */
+    private fun effectiveUserText(node: AccessibilityNodeInfo): String {
+        node.refresh()
+        val raw = node.text?.toString() ?: ""
+        val t = raw.trim()
+        if (t.isEmpty()) return ""
+        val hint = getHint(node)?.trim()
+        if (!hint.isNullOrEmpty() && t.equals(hint, ignoreCase = true)) return ""
+        val cd = node.contentDescription?.toString()?.trim()
+        if (!cd.isNullOrEmpty() && t.equals(cd, ignoreCase = true)) return ""
+        return t
+    }
+
     private fun findInputNode(root: AccessibilityNodeInfo, cfg: AppConfig): AccessibilityNodeInfo? {
+        // ID-based first, but only if editable/visible
         for (id in cfg.inputIds) {
             try {
                 val list = root.findAccessibilityNodeInfosByViewId(id)
-                if (list.isNotEmpty()) return list.first()
+                val n = list.firstOrNull { isRealEditable(it) }
+                if (n != null) return n
             } catch (_: Throwable) {}
         }
+        // Fallback: scan by class but require editability
         val q = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
         while (q.isNotEmpty()) {
             val n = q.removeFirst()
-            if (n.className == cfg.inputClass) return n
+            if ((n.className == cfg.inputClass || n.className?.toString()?.contains("EditText", true) == true)
+                && isRealEditable(n)
+            ) return n
             for (i in 0 until n.childCount) n.getChild(i)?.let { q.add(it) }
         }
         return null
@@ -293,53 +330,66 @@ class HumanLikeTypingService : AccessibilityService() {
         return latest
     }
 
-    // ───────────────── typing & send (exactly once per window) ─────────────────
+    // ───────────────── typing & send (arm one-shot only after real write) ─────────────────
 
     private fun simulateTypingAndSend(node: AccessibilityNodeInfo, cfg: AppConfig) {
         if (typedThisWindow || isTypingInProgress) return
-        typedThisWindow = true
         isTypingInProgress = true
         scheduleOverlayUpdate()
 
         val mode = prefs.getString(PREF_INPUT_HANDLING, MODE_CLEAR) ?: MODE_CLEAR
-        val existing = node.text?.toString().orEmpty()
+        val existing = effectiveUserText(node)
+        val sentence = sentences.firstOrNull()?.text.orEmpty()
 
-        when (mode) {
-            MODE_SKIP -> {
-                if (existing.isNotBlank()) {
-                    Log.d(TAG, "MODE_SKIP: field non-empty → do nothing this window.")
-                    isTypingInProgress = false
-                    scheduleOverlayUpdate()
-                    return
-                }
-            }
-            MODE_CLEAR -> {
-                val clearArgs = Bundle().apply {
-                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
-                }
-                node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, clearArgs)
-            }
-            MODE_APPEND -> { /* keep existing; append below */ }
-        }
-
-        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-
-        val newText = sentences.firstOrNull()?.text.orEmpty()
-        if (newText.isEmpty()) {
-            Log.d(TAG, "No sentence to type; abort.")
+        // MODE_SKIP: skip only if *actual* user text exists (hint is treated as empty)
+        if (mode == MODE_SKIP && existing.isNotBlank()) {
+            Log.d(TAG, "MODE_SKIP: field has user text (${existing.length} chars) → skipping this window.")
+            typedThisWindow = true
             isTypingInProgress = false
             scheduleOverlayUpdate()
             return
         }
 
-        var current = if (mode == MODE_APPEND && existing.isNotBlank()) existing + "\n" else ""
-        var delayMs = 0L
-        val backspaceIndex = if (newText.length > 3) Random.nextInt(1, newText.length - 1) else -1
+        // No content to type → allow retry later (don’t arm latch)
+        if (sentence.isBlank()) {
+            Log.d(TAG, "No sentences available; aborting without arming latch.")
+            isTypingInProgress = false
+            scheduleOverlayUpdate()
+            return
+        }
 
-        newText.forEachIndexed { i, c ->
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+
+        var current = when {
+            mode == MODE_CLEAR -> ""
+            mode == MODE_APPEND && existing.isNotBlank() -> existing + "\n"
+            else -> existing
+        }
+
+        val chars = sentence.toCharArray()
+        val backspaceIndex = if (chars.size > 3) Random.nextInt(1, chars.size - 1) else -1
+
+        // Try first char immediately to verify we can write
+        current += chars.first()
+        if (!setNodeText(node, current)) {
+            Log.d(TAG, "First char write failed (SET_TEXT). Not arming latch; will retry on next scan.")
+            isTypingInProgress = false
+            scheduleOverlayUpdate()
+            return
+        }
+
+        // We successfully wrote: arm one-shot
+        typedThisWindow = true
+        scheduleOverlayUpdate()
+
+        // Continue human-like typing from index 1
+        var delayMs = Random.nextLong(90, 220)
+        for (i in 1 until chars.size) {
+            val c = chars[i]
             val charDelay = Random.nextLong(90, 220)
             delayMs += charDelay
+
             handler.postDelayed({
                 current += c
                 setNodeText(node, current)
@@ -375,20 +425,18 @@ class HumanLikeTypingService : AccessibilityService() {
                 SendResult.IME_FALLBACK      -> "Send: IME fallback"
                 SendResult.FAILED            -> "Send: failed (no control found)"
             })
-            // Keep isTypingInProgress=true; we only re-enable on window change.
+            // Keep isTypingInProgress=true; reset on window change.
             scheduleOverlayUpdate()
         }, sendDelay)
     }
 
-    private fun setNodeText(node: AccessibilityNodeInfo, value: String) {
+    private fun setNodeText(node: AccessibilityNodeInfo, value: String): Boolean {
         val args = Bundle().apply {
-            putCharSequence(
-                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                value
-            )
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
         }
         val ok = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-        if (!ok) Log.d(TAG, "ACTION_SET_TEXT failed once (may succeed later)")
+        if (!ok) Log.d(TAG, "ACTION_SET_TEXT failed for value length=${value.length}")
+        return ok
     }
 
     // ───────────────────────── robust send paths ─────────────────────────
@@ -426,11 +474,8 @@ class HumanLikeTypingService : AccessibilityService() {
         }
 
         val args = Bundle().apply {
-            val current = inputNode.text?.toString().orEmpty()
-            putCharSequence(
-                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                current + "\n"
-            )
+            val current = effectiveUserText(inputNode)
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, current + "\n")
         }
         if (inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
             return SendResult.IME_FALLBACK
@@ -531,12 +576,12 @@ class HumanLikeTypingService : AccessibilityService() {
 
     private fun refreshOverlayText() {
         val v = overlayView ?: return
+        val mode = prefs.getString(PREF_INPUT_HANDLING, MODE_CLEAR) ?: MODE_CLEAR
+        val firstLen = sentences.firstOrNull()?.text?.length ?: 0
         val info = buildString {
-            appendLine("pkg=${currentPkg ?: "none"}")
-            appendLine("win=${currentWindowId ?: -1}")
-            appendLine("active=$serviceActive")
-            appendLine("typedThisWin=$typedThisWindow")
-            appendLine("typing=$isTypingInProgress")
+            appendLine("pkg=${currentPkg ?: "none"} win=${currentWindowId ?: -1}")
+            appendLine("active=$serviceActive typedThisWin=$typedThisWindow typing=$isTypingInProgress")
+            appendLine("mode=$mode sentenceLen=$firstLen")
         }
         v.text = info
     }
