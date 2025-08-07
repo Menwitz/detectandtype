@@ -23,10 +23,12 @@ import com.menwitz.humanliketyping.data.repository.SentenceRepository
 import com.menwitz.humanliketyping.ui.SettingsActivity
 import com.menwitz.humanliketyping.config.AppConfig
 import com.menwitz.humanliketyping.config.AppRegistry
+import kotlin.random.Random
+
+private const val TAG = "HLTService"
 
 class HumanLikeTypingService : AccessibilityService() {
     companion object {
-        private const val TAG = "HLTService"
         const val ACTION_START = "com.menwitz.humanliketyping.START_SERVICE"
         const val ACTION_STOP  = "com.menwitz.humanliketyping.STOP_SERVICE"
         private const val CHANNEL_ID = "typing_status_channel"
@@ -47,9 +49,7 @@ class HumanLikeTypingService : AccessibilityService() {
             when (intent.action) {
                 ACTION_START -> {
                     Log.d(TAG, "Received START; serviceActive=$serviceActive")
-                    if (serviceActive) {
-                        showStatusNotification()
-                    }
+                    if (serviceActive) showStatusNotification()
                 }
                 ACTION_STOP -> {
                     Log.d(TAG, "Received STOP; serviceActive=$serviceActive")
@@ -62,10 +62,9 @@ class HumanLikeTypingService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        prefs = PreferenceManager.getDefaultSharedPreferences(this)
+        prefs     = PreferenceManager.getDefaultSharedPreferences(this)
         sentences = SentenceRepository.loadDefault(this)
 
-        // Register start/stop broadcasts
         registerReceiver(
             controlReceiver,
             IntentFilter().apply {
@@ -75,7 +74,6 @@ class HumanLikeTypingService : AccessibilityService() {
             Context.RECEIVER_NOT_EXPORTED
         )
 
-        // Configure which accessibility events to listen for
         serviceInfo = AccessibilityServiceInfo().apply {
             eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
                     AccessibilityEvent.TYPE_VIEW_FOCUSED or
@@ -85,40 +83,33 @@ class HumanLikeTypingService : AccessibilityService() {
             flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
         }
 
-        // Initialize active state and notification if needed
         serviceActive = prefs.getBoolean("service_active", false)
-        Log.d(TAG, "onServiceConnected(): persisted serviceActive=$serviceActive")
-        if (serviceActive) {
-            showStatusNotification()
-        }
+        if (serviceActive) showStatusNotification()
+        Log.d(TAG, "onServiceConnected(): serviceActive=$serviceActive")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        // Update config on window or focus changes
+        // update config
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
             event.eventType == AccessibilityEvent.TYPE_VIEW_FOCUSED) {
-
             val pkg = event.packageName?.toString()
             val cfg = pkg?.let { AppRegistry.map[it] }
             if (cfg !== currentConfig) {
                 currentConfig = cfg
-                val status = if (cfg != null) "supported" else "ignored"
-                Log.d(TAG, "Switched config for package=$pkg → $status")
+                val status = if (cfg!=null) "supported" else "ignored"
+                Log.d(TAG, "Switched config: $pkg → $status")
             }
         }
 
-        // Only proceed if service is active and config known
         if (!serviceActive) return
         val cfg = currentConfig ?: return
 
-        // On content change or focus, detect and queue typing
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
             event.eventType == AccessibilityEvent.TYPE_VIEW_FOCUSED) {
-
             rootInActiveWindow?.let { root ->
                 findInputNode(root, cfg)?.let { input ->
-                    Log.d(TAG, "Detected input field in ${event.packageName}")
-                    performHumanLikeTyping(input)
+                    Log.d(TAG, "Typing into ${cfg.inputClass} in ${event.packageName}")
+                    simulateTypingAndSend(input, cfg)
                 }
             }
         }
@@ -133,8 +124,107 @@ class HumanLikeTypingService : AccessibilityService() {
         super.onDestroy()
     }
 
+    private fun simulateTypingAndSend(node: AccessibilityNodeInfo, cfg: AppConfig) {
+        // 1) focus & click
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+
+        // 2) prepare text
+        val text = sentences.firstOrNull()?.text.orEmpty()
+        var current = ""
+
+        // pick a random index for a single backspace correction
+        val backspaceIndex = if (text.length>3) Random.nextInt(1, text.length-1) else -1
+
+        // 3) simulate each keystroke
+        var cumulativeDelay = 0L
+        for ((i, c) in text.withIndex()) {
+            val delay = Random.nextLong(100, 300)
+            cumulativeDelay += delay
+
+            // type character
+            handler.postDelayed({
+                current += c
+                val args = Bundle().apply {
+                    putCharSequence(
+                        AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                        current
+                    )
+                }
+                node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            }, cumulativeDelay)
+
+            // occasional backspace
+            if (i == backspaceIndex) {
+                val bsDelay = cumulativeDelay + Random.nextLong(200, 400)
+                // remove last char
+                handler.postDelayed({
+                    val truncated = current.dropLast(1)
+                    val args = Bundle().apply {
+                        putCharSequence(
+                            AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                            truncated
+                        )
+                    }
+                    node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                }, bsDelay)
+                // retype char
+                handler.postDelayed({
+                    current += c
+                    val args = Bundle().apply {
+                        putCharSequence(
+                            AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                            current
+                        )
+                    }
+                    node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                }, bsDelay + Random.nextLong(100,200))
+                cumulativeDelay = bsDelay + 100
+            }
+        }
+
+        // 4) after typing finishes, schedule send
+        val sendDelay = cumulativeDelay + Random.nextLong(300, 700)
+        handler.postDelayed({
+            rootInActiveWindow?.let { root ->
+                // try configured send-button IDs
+                for (id in cfg.sendButtonIds) {
+                    val list = root.findAccessibilityNodeInfosByViewId(id)
+                    if (list.isNotEmpty()) {
+                        list.first().performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                        Log.d(TAG, "Clicked send-button id=$id")
+                        return@let
+                    }
+                }
+                // fallback: send via IME action
+                node.performAction(AccessibilityNodeInfo.ACTION_NEXT_HTML_ELEMENT)
+                Log.d(TAG, "Fallback send via IME action")
+            }
+        }, sendDelay)
+    }
+
+    private fun findInputNode(
+        root: AccessibilityNodeInfo,
+        cfg: AppConfig
+    ): AccessibilityNodeInfo? {
+        // try explicit IDs
+        for (id in cfg.inputIds) {
+            val list = root.findAccessibilityNodeInfosByViewId(id)
+            if (list.isNotEmpty()) return list.first()
+        }
+        // fallback to class scan
+        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            if (node.className == cfg.inputClass) return node
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { queue.add(it) }
+            }
+        }
+        return null
+    }
+
     private fun showStatusNotification() {
-        Log.d(TAG, "Posting status notification")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val chan = NotificationChannel(
                 CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW
@@ -157,49 +247,5 @@ class HumanLikeTypingService : AccessibilityService() {
             .setContentIntent(pi)
             .build()
         NotificationManagerCompat.from(this).notify(NOTIF_ID, n)
-    }
-
-    private fun performHumanLikeTyping(node: AccessibilityNodeInfo) {
-        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        var current = ""
-        sentences.firstOrNull()?.text.orEmpty().forEachIndexed { i, c ->
-            current += c
-            handler.postDelayed({
-                val args = Bundle().apply {
-                    putCharSequence(
-                        AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                        current
-                    )
-                }
-                node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-            }, 150L * i)
-        }
-    }
-
-    /**
-     * Finds the first input node according to the AppConfig:
-     * 1) Try each configured view-ID in order
-     * 2) If none found, scan the view hierarchy for the configured inputClass
-     */
-    private fun findInputNode(
-        root: AccessibilityNodeInfo,
-        cfg: AppConfig
-    ): AccessibilityNodeInfo? {
-        // 1) Explicit ID lookup
-        for (id in cfg.inputIds) {
-            val list = root.findAccessibilityNodeInfosByViewId(id)
-            if (list.isNotEmpty()) return list.first()
-        }
-        // 2) Fallback to class scan
-        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
-        while (queue.isNotEmpty()) {
-            val node = queue.removeFirst()
-            if (node.className == cfg.inputClass) return node
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { queue.add(it) }
-            }
-        }
-        return null
     }
 }
